@@ -22,3 +22,4 @@ workspace/log_ngp.txt
 *.pt
 *.onnx
 *.bin
+*.mat
