@@ -18,7 +18,7 @@ workspace/log_ngp.txt
 .idea
 
 # Talkreal models
-.pth
-.pt
-.onnx
-.bin
+*.pth
+*.pt
+*.onnx
+*.bin
