@@ -236,7 +236,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--avatar', type=str, default='ernerf') #ernerf musetalk wav2lip
 
-    parser.add_argument('--fps', type=int, default=50) # audio FPS
+    parser.add_argument('--fps', type=int, default=25) # video FPS
+    parser.add_argument('--cfg_scale', type=float, default=1.0) # motion scale factor for model
+    parser.add_argument('--max_gen_length', type=int, default=30000) # max generation length per segment
 
     parser.add_argument('--tts', type=str, default='edgetts') #xtts gpt-sovits cosyvoice
 
