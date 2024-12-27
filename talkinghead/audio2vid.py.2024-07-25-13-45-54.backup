@@ -1,0 +1,311 @@
+import os
+import hashlib
+import subprocess
+import time
+from PIL import Image
+import cv2
+import numpy as np
+import torch
+import torchaudio
+import torchvision
+import transformers
+import copy
+from transformers import Wav2Vec2Processor
+from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model
+import torchvision.transforms as transforms
+from configs.default import get_cfg_defaults
+from core.networks.diffusion_net import DiffusionNet
+from core.networks.diffusion_util import NoisePredictor, VarianceSchedule
+from core.utils import (
+    crop_src_image,
+    get_pose_params,
+    get_video_style_clip,
+    get_wav2vec_audio_window,
+)
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__)))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'face_parcing'))
+
+from face_parsing.enhance_talk_face_multiprocess import MergeHeadBody
+from generators.utils import get_netG, render_video_old
+
+print(f"transformers version:{transformers.__version__}")
+class TalkingPuppet:
+	def __init__(self, id):
+		self.id = id
+		self.project_path = f"workspace/{self.id}"
+		self.src_face_image_path = f"{self.project_path}/frame_faces"
+		self.src_full_image_path = f"{self.project_path}/frames"
+
+		# load pose
+		self.pose_path = f"{self.project_path}/full_pose.npy"
+		self.style_clip_path = self.pose_path
+
+		pose_np = np.load(self.pose_path, allow_pickle=True)
+		# pose_np = np.tile(pose_np,(3000,1))
+		angles = pose_np[:, 224:227]
+		translations = pose_np[:, 254:257]
+		crop = pose_np[:, -3:]
+		self.pose_params = np.concatenate((angles, translations, crop), axis=1)
+		# self.pose_params_reverse = self.pose_params[::-1]
+
+		self.max_gen_len = 30000 # 
+		self.cfg_scale = 0.0
+		self.device = device = torch.device("cuda")
+		self.cfg = get_cfg_defaults()
+		self.cfg.CF_GUIDANCE.SCALE = self.cfg_scale
+		self.cfg.INFERENCE.CHECKPOINT = 'talkinghead/checkpoints/denoising_network.pth'
+		self.cfg.freeze()
+		self.wav2vec_processor = Wav2Vec2Processor.from_pretrained("talkinghead/checkpoints/wav2vec2",local_files_only=True)
+
+		self.wav2vec_model = (
+			Wav2Vec2Model.from_pretrained("talkinghead/checkpoints/wav2vec2",local_files_only=True)
+			.eval()
+			.to(device)
+		)
+		
+
+		self.diff_net = self.get_diff_net(self.cfg, self.device).to(self.device)
+		self.renderer = get_netG("talkinghead/checkpoints/renderer.pt", self.device)
+
+		style_clip_raw, style_pad_mask_raw = get_video_style_clip(
+			self.pose_path, "", style_max_len=256, start_idx=0
+		)
+
+		self.style_clip = style_clip_raw.unsqueeze(0).to(device)
+		self.style_pad_mask = (
+			style_pad_mask_raw.unsqueeze(0).to(device)
+			if style_pad_mask_raw is not None
+			else None
+		)
+		loaded_src_img = self.load_src_imgs(self.src_image_path)
+		# loaded_src_img = [loaded_src_img[0].clone() for x in range(3000)]
+		self.src_img_list = torch.stack(loaded_src_img,dim=0)
+		assert len(self.src_img_list) == self.pose_params.shape[0]
+		# self.src_img_list_reverse = self.src_img_list.reverse()
+		self.src_img_index = 0 # len(self.src_img_list)*4//5
+		self.is_reverse_src_img = False
+		tmp_dir = f"tmp_data"
+		os.makedirs(tmp_dir, exist_ok=True)
+		self.tmp_dir = tmp_dir
+		self.merger = MergeHeadBody(f'workspace/{self.id}')
+		# self.test_pose_idx()
+
+		print("TalkingPuppet init done.")
+
+	def pose_param_convert_reverse_indices(self,reverse_index_list:list):
+		full_pose_len = len(self.src_img_list)
+		result = [full_pose_len-x-1 for x in reverse_index_list]
+		return result
+
+	def load_pose_params_indices(self,need_length):
+		left_size = len(self.src_img_list) - self.src_img_index
+		if left_size >= need_length:
+			result = list(range(self.src_img_index, self.src_img_index + need_length))
+			if self.is_reverse_src_img:
+				result = self.pose_param_convert_reverse_indices(result)
+			self.src_img_index += need_length
+			if self.src_img_index == len(self.src_img_list):
+				self.src_img_index = 0
+				self.is_reverse_src_img = not self.is_reverse_src_img
+		else:
+			need_more_len = need_length - left_size
+			result = list(range(self.src_img_index, len(self.src_img_list)))
+			if self.is_reverse_src_img:
+				result = self.pose_param_convert_reverse_indices(result)
+
+			self.is_reverse_src_img = not self.is_reverse_src_img
+
+			cycle_number = need_more_len // len(self.src_img_list)
+			cycle_left_num = need_more_len % len(self.src_img_list)
+			cycle_idx = 0
+			while cycle_idx < cycle_number:
+				this_idx_list = list(range(0, len(self.src_img_list)))
+				if self.is_reverse_src_img:
+					this_idx_list = self.pose_param_convert_reverse_indices(this_idx_list)
+				self.is_reverse_src_img = not self.is_reverse_src_img
+				cycle_idx += 1
+				result += this_idx_list
+
+			this_idx_list = list(range(0, cycle_left_num))
+			if self.is_reverse_src_img:
+				this_idx_list = self.pose_param_convert_reverse_indices(this_idx_list)
+			result += this_idx_list
+			self.src_img_index = cycle_left_num
+
+		return result
+
+	def load_src_imgs(self,src_dir):
+		src_img_path = src_dir
+		file_list = [n for n in os.listdir(src_img_path) if n[-4:] == ".jpg" or n[-4:] == ".png"]
+		file_list.sort()
+		src_img_list = []
+		for f_name in file_list:
+			frame = cv2.imread(os.path.join(src_img_path, f_name))
+			frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+			src_img_raw = Image.fromarray(frame)
+			image_transform = transforms.Compose(
+				[
+					transforms.ToTensor(),
+					transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+				]
+			)
+			src_img = image_transform(src_img_raw)
+			src_img_list.append(src_img)
+		return src_img_list
+
+	@torch.no_grad()
+	def get_diff_net(self,cfg, device):
+		diff_net = DiffusionNet(
+			cfg=cfg,
+			net=NoisePredictor(cfg),
+			var_sched=VarianceSchedule(
+				num_steps=cfg.DIFFUSION.SCHEDULE.NUM_STEPS,
+				beta_1=cfg.DIFFUSION.SCHEDULE.BETA_1,
+				beta_T=cfg.DIFFUSION.SCHEDULE.BETA_T,
+				mode=cfg.DIFFUSION.SCHEDULE.MODE,
+			),
+		)
+		checkpoint = torch.load(cfg.INFERENCE.CHECKPOINT, map_location=device)
+		model_state_dict = checkpoint["model_state_dict"]
+		diff_net_dict = {
+			k[9:]: v for k, v in model_state_dict.items() if k[:9] == "diff_net."
+		}
+		diff_net.load_state_dict(diff_net_dict, strict=True)
+		diff_net.eval()
+
+		return diff_net
+
+	@torch.no_grad()
+	def inference_one_video(self,
+			cfg,
+			audio_raw,
+			diff_net,
+			device,
+			max_audio_len=None,
+			sample_method="ddim",
+			ddim_num_step=10,
+	):
+		# audio_raw = audio_data = np.load(audio_path)
+		#
+		# if max_audio_len is not None:
+		# 	audio_raw = audio_raw[: max_audio_len * 50]
+		gen_num_frames = len(audio_raw) // 2
+
+		audio_win_array = get_wav2vec_audio_window(
+			audio_raw,
+			start_idx=0,
+			num_frames=gen_num_frames,
+			win_size=cfg.WIN_SIZE,
+		)
+
+		audio_win = torch.tensor(audio_win_array).to(device)
+		audio = audio_win.unsqueeze(0)
+
+
+		gen_exp_stack = diff_net.sample(
+			audio,
+			self.style_clip,
+			self.style_pad_mask,
+			output_dim=cfg.DATASET.FACE3D_DIM,
+			use_cf_guidance=cfg.CF_GUIDANCE.INFERENCE,
+			cfg_scale= 1.0, # cfg.CF_GUIDANCE.SCALE,
+			sample_method=sample_method,
+			ddim_num_step=ddim_num_step,
+		)
+		gen_exp = gen_exp_stack[0].cpu().numpy()
+
+		return gen_exp
+
+	def process_wav(self,wav_path):
+		wav_name = os.path.basename(wav_path)
+		wav_16k_path = os.path.join(self.tmp_dir, f"{wav_name}_16K.wav")
+		command = f"ffmpeg -loglevel error -y -i {wav_path} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {wav_16k_path}"
+		subprocess.run(command.split())
+
+		speech_array, sampling_rate = torchaudio.load(wav_16k_path)
+		audio_data = speech_array.squeeze().numpy()
+		inputs = self.wav2vec_processor(
+			audio_data, sampling_rate=16_000, return_tensors="pt", padding=True
+		)
+
+		with torch.no_grad():
+			audio_embedding = self.wav2vec_model(
+				inputs.input_values.to(self.device), return_dict=False
+			)[0]
+		return audio_embedding[0].cpu().numpy(),wav_16k_path
+
+	def generate(self, wav_path):
+		t1 = time.time()
+		audio_embedding,wav_16k_path = self.process_wav(wav_path)
+		with open(wav_path, 'rb') as f:
+			wav_data = f.read()
+		sub_project_hash = hashlib.sha384(wav_data).hexdigest()
+		sub_project_path = f"{self.project_path}/results/{sub_project_hash}"
+		os.makedirs(sub_project_path, exist_ok=True)
+		f.close()
+		
+		t2 = time.time()
+		output_name = os.path.basename(wav_path)
+
+		gen_num_frames = len(audio_embedding) // 2
+		index_list = self.load_pose_params_indices(gen_num_frames)
+		index_list = np.array(index_list)
+		pose_params = self.pose_params[index_list]
+		src_img_list = self.src_img_list[index_list]
+
+		with torch.no_grad():
+			# generate face motion
+			gen_exp = self.inference_one_video(
+				self.cfg,
+				audio_embedding,
+				self.diff_net,
+				self.device,
+				max_audio_len=self.max_gen_len,
+			)
+			t3 = time.time()
+
+			face_motion_np = np.concatenate((gen_exp, pose_params), axis=1)
+
+			# render video
+			output_video_path = f"{sub_project_path}/{output_name}.mp4"
+
+			imgs = render_video_old(
+				self.renderer,
+				src_img_list,
+				face_motion_np,
+				# wav_16k_path,
+				# output_video_path,
+				self.device,
+				merger = self.merger
+			)
+			t4 = time.time()
+
+			# merged_path = f'workspace/{self.id}/merged'
+			# os.system(f"rm -rf {merged_path}")
+			# os.mkdir(merged_path)
+			silent_video_path = f"{sub_project_path}/output-silence.mp4"
+			self.merger.merge_numpy(imgs, index_list, silent_video_path)
+			# silent_video_path = f"{sub_project_path}/output-silence_h264.mp4"
+
+			# self.merge_png_to_mp4(merged_path, silent_video_path)
+			# torchvision.io.write_video(silent_video_path, merged_numpy_tensor.cpu(), 25)
+			t5 = time.time()
+			os.system(f"ffmpeg -loglevel error -y -i {silent_video_path} -i {wav_16k_path} -c:v copy -c:a aac -strict experimental -map 0:v:0 -map 1:a:0 {output_video_path}")
+			# os.remove(silent_video_path)
+			t6 = time.time()
+			print(f"{output_video_path};\ntotal time:{t6-t1};\naudio process time:{t2-t1};\nface motion time:{t3-t2};\nrender time:{t4-t3};\nmerge + mp4 write time:{t5-t4};\nadd sound time:{t6-t5}.")
+
+			# clear vram cache
+			torch.cuda.empty_cache()
+
+			return output_video_path
+
+if __name__ == "__main__":
+	talking_puppet = TalkingPuppet('92e87ec85560e81d70fd8103c3fa60fa170be1e146372f92557d5d97a66a8a00380090c49e7f3dc50d85e2b3bfbd1b24')
+	# talking_puppet.shutup()
+	# talking_puppet.generate("inputs/audio_short.mp3")
+	# talking_puppet.generate("data/audio/hushi_news.wav")
+	# talking_puppet.generate("data/audio/trump_30s.aac")
+	talking_puppet.generate("test_submit.mp3")
+	talking_puppet.generate("tts_clone/workspace/liuzhenqi/0d44f5bc-b833-4e26-8d76-d2adbb746098/audio.mp3")

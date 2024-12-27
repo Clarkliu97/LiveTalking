@@ -32,6 +32,12 @@ from io import BytesIO
 from threading import Thread, Event
 from enum import Enum
 
+from io import BytesIO
+import base64
+import json
+import uuid
+import os
+
 class State(Enum):
     RUNNING=0
     PAUSE=1
@@ -342,3 +348,65 @@ class XTTS(BaseTTS):
                     self.parent.put_audio_frame(stream[idx:idx+self.chunk])
                     streamlen -= self.chunk
                     idx += self.chunk 
+
+###########################################################################################
+class VolcTTS(BaseTTS): # TODO: update this
+    def txt_to_audio(self, msg, stop_event): 
+        t_0 = time.time()
+        access_token = os.environ.get("VOLCANO_TTS_TOKEN")
+        secret = os.environ.get("VOLCANO_TTS_SECRET_KEY")
+        appid = '7449418871'
+
+        voice_type = "BV001_streaming"
+        host = "openspeech.bytedance.com"
+        api_url = f"https://{host}/api/v1/tts"
+
+        header = {"Authorization": f"Bearer; {access_token}"}
+
+        request_json = {
+            "app": {
+                "appid": appid,
+                "token": access_token,
+                "cluster": "volcano_tts"
+            },
+            "user": {
+                "uid": "xyuser" 
+            },
+            "audio": {
+                "voice_type": voice_type,
+                "encoding": "mp3",
+                "compression_rate": 1,
+                "rate": 24000,
+                "speed_ratio": 1.0,
+                "volume_ratio": 1.0,
+                "pitch_ratio": 1.0,
+                "emotion": "happy",
+                "language": "cn"
+            },
+            "request": {
+                "reqid": str(uuid.uuid4()),
+                "text": msg,
+                "text_type": "plain",
+                "operation": "query",
+                "silence_duration": "0",
+                "with_frontend": 1,
+                "frontend_type": "unitTson", 
+                "pure_english_opt": "1"
+            }
+        }
+
+        try:
+            resp = requests.post(api_url, json.dumps(request_json), headers=header)
+            # print(f"resp body: \n{resp.json()}")
+            if "data" in resp.json():
+                data = resp.json()["data"]
+                data = base64.b64decode(data)
+                # from bytes to soundfile
+                stream, sample_rate = sf.read(BytesIO(data))
+                if stop_event.is_set():
+                    return
+                self.parent.feed_audio(stream, sample_rate)
+        except Exception as e:
+            print(f"resp body: {resp}")
+            e.with_traceback()
+        print(f'-------volc tts time:{time.time()-t_0:.4f}s')
