@@ -42,15 +42,12 @@ pcs = set()
 
 def build_nerfreal(sessionid):
     opt.sessionid=sessionid
-    if opt.model == 'wav2lip':
-        from lipreal import LipReal
-        nerfreal = LipReal(opt,model,avatar)
-    elif opt.model == 'musetalk':
-        from musereal import MuseReal
-        nerfreal = MuseReal(opt,model,avatar)
-    elif opt.model == 'ernerf':
-        from nerfreal import NeRFReal
-        nerfreal = NeRFReal(opt,model,avatar)
+    if opt.mode=='movieplay':
+        from movieplay import MoviePlay
+        nerfreal = MoviePlay(opt)
+    else:
+        from talkreal import TalkReal
+        nerfreal = TalkReal(opt, 'cuda')
     return nerfreal
 
 #@app.route('/offer', methods=['POST'])
@@ -127,69 +124,6 @@ async def human(request):
         ),
     )
 
-async def humanaudio(request):
-    try:
-        form= await request.post()
-        sessionid = int(form.get('sessionid',0))
-        fileobj = form["file"]
-        filename=fileobj.filename
-        filebytes=fileobj.file.read()
-        nerfreals[sessionid].put_audio_file(filebytes)
-
-        return web.Response(
-            content_type="application/json",
-            text=json.dumps(
-                {"code": 0, "msg":"ok"}
-            ),
-        )
-    except Exception as e:
-        return web.Response(
-            content_type="application/json",
-            text=json.dumps(
-                {"code": -1, "msg":"err","data": ""+e.args[0]+""}
-            ),
-        )
-
-async def set_audiotype(request):
-    params = await request.json()
-
-    sessionid = params.get('sessionid',0)    
-    nerfreals[sessionid].set_curr_state(params['audiotype'],params['reinit'])
-
-    return web.Response(
-        content_type="application/json",
-        text=json.dumps(
-            {"code": 0, "data":"ok"}
-        ),
-    )
-
-async def record(request):
-    params = await request.json()
-
-    sessionid = params.get('sessionid',0)
-    if params['type']=='start_record':
-        # nerfreals[sessionid].put_msg_txt(params['text'])
-        nerfreals[sessionid].start_recording()
-    elif params['type']=='end_record':
-        nerfreals[sessionid].stop_recording()
-    return web.Response(
-        content_type="application/json",
-        text=json.dumps(
-            {"code": 0, "data":"ok"}
-        ),
-    )
-
-async def is_speaking(request):
-    params = await request.json()
-
-    sessionid = params.get('sessionid',0)
-    return web.Response(
-        content_type="application/json",
-        text=json.dumps(
-            {"code": 0, "data": nerfreals[sessionid].is_speaking()}
-        ),
-    )
-
 async def on_shutdown(app):
     # close peer connections
     coros = [pc.close() for pc in pcs]
@@ -234,7 +168,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--use_device', type=str, default='0') # 0,1,2,3,...
 
-    parser.add_argument('--avatar', type=str, default='ernerf') #ernerf musetalk wav2lip
+    parser.add_argument('--mode', type=str, default='dev') # dev, movieplay
 
     parser.add_argument('--fps', type=int, default=25) # video FPS
     parser.add_argument('--cfg_scale', type=float, default=1.0) # motion scale factor for model
@@ -250,33 +184,11 @@ if __name__ == '__main__':
 
     opt = parser.parse_args()
 
-    # TODO: Use TalkReal, load model and avatar
-    if opt.model == 'ernerf': 
-        from nerfreal import NeRFReal,load_model,load_avatar
-        model = load_model(opt)
-        avatar = load_avatar(opt) 
-    elif opt.model == 'musetalk':
-        from musereal import MuseReal,load_model,load_avatar,warm_up
-        print(opt)
-        model = load_model()
-        avatar = load_avatar(opt.avatar_id) 
-        warm_up(opt.batch_size,model)      
-    elif opt.model == 'wav2lip':
-        from lipreal import LipReal,load_model,load_avatar,warm_up
-        print(opt)
-        model = load_model("./models/wav2lip.pth")
-        avatar = load_avatar(opt.avatar_id)
-        warm_up(opt.batch_size,model,96)
-
     #############################################################################
     appasync = web.Application()
     appasync.on_shutdown.append(on_shutdown)
     appasync.router.add_post("/offer", offer)
     appasync.router.add_post("/human", human)
-    appasync.router.add_post("/humanaudio", humanaudio)
-    appasync.router.add_post("/set_audiotype", set_audiotype)
-    appasync.router.add_post("/record", record)
-    appasync.router.add_post("/is_speaking", is_speaking)
     appasync.router.add_static('/',path='web')
 
     # Configure default CORS settings.

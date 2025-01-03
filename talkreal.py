@@ -57,13 +57,13 @@ class TalkReal:
         self.opt = opt
 
         # Load configs
-        self.avatar = opt.avatar
+        # self.avatar = opt.avatar
         self.fps = opt.fps
         self.cfg_scale = opt.cfg_scale
         self.max_gen_length = opt.max_gen_length
 
         # load avatar
-        self.project_path = f"workspace/{self.avatar}"
+        self.project_path = f"workspace/test"
         self.src_face_image_path = f"{self.project_path}/frame_faces"
         self.src_full_image_path = f"{self.project_path}/frames"
 
@@ -128,6 +128,11 @@ class TalkReal:
                 print(f"loaded {i+1} images.")
         print("src full images loaded.")
 
+        # get index list of whole video foward and backward
+        self.video_index_list = list(range(len(self.src_face_list)))
+        self.video_index_list += list(range(len(self.src_face_list)-1, -1, -1))
+        print("video index list created.")
+
         # load crop info
         self.crop_info_path = f"{self.project_path}/frame_faces/config.json"
         with open(self.crop_info_path, 'r') as f:
@@ -160,7 +165,7 @@ class TalkReal:
 
         # cut off event
         self.cut_off_event = threading.Event()
-        threading.Thread(target=self.cut_off_thread, daemon=True).start()
+        # threading.Thread(target=self.cut_off_thread, daemon=True).start()
 
         # start generation process
         self.gen_stop_event = threading.Event()
@@ -234,24 +239,24 @@ class TalkReal:
         return diff_net
     
 
-    def cut_off_thread(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # def cut_off_thread(self):
+    #     loop = asyncio.new_event_loop()
+    #     asyncio.set_event_loop(loop)
 
-        loop.create_task(self.cut_off_loop(loop))
-        print("run cut_off_loop in thread")
-        loop.run_forever()
-
-
-    async def cut_off_loop(self, loop: asyncio.AbstractEventLoop):
-        while True:
-            await loop.run_in_executor(None, self.cut_off_event.wait)
-            await self.cut_off()
-            self.cut_off_event.clear()
+    #     loop.create_task(self.cut_off_loop(loop))
+    #     print("run cut_off_loop in thread")
+    #     loop.run_forever()
 
 
-    async def cut_off(self):
-        asyncio.create_task(self.llm.cut_off())
+    # async def cut_off_loop(self, loop: asyncio.AbstractEventLoop):
+    #     while True:
+    #         await loop.run_in_executor(None, self.cut_off_event.wait)
+    #         await self.cut_off()
+    #         self.cut_off_event.clear()
+
+
+    # async def cut_off(self):
+    #     asyncio.create_task(self.llm.cut_off())
     
 
     def put_echo_msg_txt(self, msg):
@@ -291,5 +296,102 @@ class TalkReal:
         index_list = []
         audio = None
 
+        print("Start generating...")
+
+        while True: 
+            print('Generating...')
+            if gen_stop_event.is_set():
+                # stop the generation process
+                break
+
+            if gen_cut_off_event.is_set():
+                # cut off the generation process
+                audio = None
+                current_index = index_list[0]
+                for gesture in self.gestures: 
+                    if current_index >= gesture["start_frame"] and current_index <= gesture["end_frame"]:
+                        # if the current index is in a gesture, cut off all other gestures after this gesture
+                        index_list = index_list[:index_list.index(gesture["end_frame"])]
+                        break
+                gen_cut_off_event.clear()
+
+            # shrink the output queue size to 5
+            if generated_queue.qsize() > 5:
+                # print('sleep qsize=',generated_queue.qsize())
+                time.sleep(0)
+                continue
+
+            # try to get audio from queue
+            if audio is None: 
+                try:
+                    audio = audio_queue.get(block=False)
+                except:
+                    audio = None
+
+            if audio is None: 
+                if len(index_list) == 0: 
+                    index_list += self.video_index_list
+            frame = self.loaded_src_full[index_list.pop(0)]
+            res_frame = VideoFrame.from_ndarray(frame, format="rgb24")
+
+            # generate two pieces 16000 Hz silence audio frames with length of 1/50s
+            audio_frames = []
+            for _ in range(2):
+                num_samples = int(16000 * 1 / 50)
+                silent_audio = np.zeros((1, num_samples), dtype=np.int16)
+                audio_frame = av.AudioFrame.from_ndarray(silent_audio, layout='mono')
+                audio_frame.sample_rate = 16000
+                audio_frames.append(audio_frame)
+
+            generated_queue.put((res_frame, audio_frames))
+
+        print("End generating.")
+
         # generate frames TODO:
         pass
+
+    def process_frames(self, quit_event, loop=None, audio_track=None, video_track=None):
+        # get result from merger and push to stream queue
+        while not quit_event.is_set():
+            if not video_track._queue.qsize() > 5:
+                res_frame, audio_frames = self.generated_queue.get()
+                task = asyncio.run_coroutine_threadsafe(video_track._queue.put(res_frame), loop)
+                task.result()
+                for audio_frame in audio_frames:
+                    task = asyncio.run_coroutine_threadsafe(audio_track._queue.put(audio_frame), loop)
+                    task.result()
+            else:
+                time.sleep(0)
+
+    def render(self, quit_event, loop=None, audio_track=None, video_track=None): 
+        # start TTS
+        # self.tts.render(quit_event)
+        # print("TTS started!")
+        # self.llm.render(quit_event)
+        # print("LLM started!")
+        # self.chroma_db.render(quit_event)
+        # print("Chroma database started!")
+        self.audio_tracks.append(audio_track)
+        self.video_tracks.append(video_track)
+
+        play_thread = threading.Thread(target=self.process_frames, args=(quit_event, loop, audio_track, video_track))
+        play_thread.start()
+
+
+if __name__ == "__main__":
+    # test code
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--avatar', type=str, default='test')
+    parser.add_argument('--cfg_scale', type=float, default=1.0)
+    parser.add_argument('--fps', type=int, default=25)
+    parser.add_argument('--max_gen_length', type=int, default=300000)
+    opt = parser.parse_args()
+
+    talkreal = TalkReal(opt, device)
+    # Wait for the generation process to end
+    talkreal.gen_process.join()
+    
+    print("TalkReal initialized.")
